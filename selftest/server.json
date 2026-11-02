@@ -1,0 +1,10 @@
+{
+    "name":"presidetesthelpersselftest",
+    "web":{
+        "http":{
+            "port":5941
+        },
+        "webroot":"./"
+    },
+    "openBrowser":false
+}
