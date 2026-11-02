@@ -1,2 +1,6 @@
 /.twgit_features_subject
 /.twgit
+/dist/
+/preside/
+/selftest/preside-test-helpers/
+/selftest/results/

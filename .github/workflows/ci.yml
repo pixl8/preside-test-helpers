@@ -1,0 +1,200 @@
+name: Continuous Integration
+on:
+  push:
+  pull_request:
+
+env:
+  DEFAULT_PRESIDE_VERSION: 10.31.0
+
+jobs:
+  runtests:
+    name: Self-tests (${{ matrix.cfengine }})
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[twgit] Init') && github.ref != 'refs/heads/stable'"
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cfengine: "lucee@5.4"
+            jdkVersion: "11"
+            experimental: false
+          - cfengine: "lucee@7.0"
+            jdkVersion: "25"
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release version number
+        id: versiongen
+        uses: pixl8/github-action-twgit-release-version-generator@v3
+
+      - name: Setup flow variables
+        env:
+          RELEASE_NUMBER: ${{ steps.versiongen.outputs.semver_release_number }}
+          RELEASE_STRING: ${{ steps.versiongen.outputs.semver_release_string }}
+          IS_SNAPSHOT: ${{ steps.versiongen.outputs.semver_is_snapshot }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/heads/release-* ]] || [[ "$GITHUB_REF" == refs/tags/v* ]] ; then
+            if [[ "$IS_SNAPSHOT" == "true" ]] ; then
+              echo "PRESIDE_VERSION=${RELEASE_NUMBER}-snapshot" >> $GITHUB_ENV
+              echo "RELEASE_VERSION=${RELEASE_NUMBER}-snapshot" >> $GITHUB_ENV
+            else
+              echo "PRESIDE_VERSION=${RELEASE_NUMBER}" >> $GITHUB_ENV
+              echo "RELEASE_VERSION=${RELEASE_STRING}" >> $GITHUB_ENV
+            fi
+          else
+            echo "PRESIDE_VERSION=${DEFAULT_PRESIDE_VERSION}" >> $GITHUB_ENV
+            echo "RELEASE_VERSION=${DEFAULT_PRESIDE_VERSION}" >> $GITHUB_ENV
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: ${{ matrix.jdkVersion }}
+
+      - name: Setup CommandBox CLI
+        uses: Ortus-Solutions/setup-commandbox@v2.0.1
+
+      - name: Install Preside ${{ env.PRESIDE_VERSION }}
+        run: box install presidecms@${PRESIDE_VERSION} --noSave
+
+      - name: Build package
+        env:
+          PRESIDE_ROOT: ./preside
+        run: box task run taskFile=Build.cfc :zip=false
+
+      - name: Upload package
+        if: ${{ !matrix.experimental }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: dist/preside-test-helpers/
+          if-no-files-found: error
+
+      - name: Install dependencies
+        run: |
+          cd selftest/
+          box install --force --noSave --verbose
+
+      - name: Start ${{ matrix.cfengine }} Server
+        run: |
+          cd selftest/
+          box server start serverConfigFile="server.json" cfengine="${{ matrix.cfengine }}" --noSaveSettings
+          http_response=$(curl --max-time 120 -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:5941/runTests.cfm?reporter=text")
+          if [ $http_response != "200" ]; then
+            echo "Self-test server startup exited with error: $http_response"
+            echo "Logs:"
+            echo "============"
+            echo
+            box server log name="presidetesthelpersselftest"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: |
+          cd selftest/
+          mkdir -p results
+          box testbox run --verbose outputFile=results/test-results outputFormats=json,antjunit
+
+      - name: Upload Test Results Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-results-${{ matrix.cfengine }}-jdk${{ matrix.jdkVersion }}
+          path: |
+            selftest/results/*
+
+      - name: Publish Test Results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          check_name: Self-test results (${{ matrix.cfengine }})
+          files: selftest/results/*.xml
+
+  publish:
+    name: Publish to Forgebox
+    needs:
+      - runtests
+    runs-on: ubuntu-latest
+    if: "success() && github.event_name != 'pull_request' && ( startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release-' ) )"
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release version number
+        id: versiongen
+        uses: pixl8/github-action-twgit-release-version-generator@v3
+
+      - name: Set release variables
+        env:
+          RELEASE_NUMBER: ${{ steps.versiongen.outputs.semver_release_number }}
+          RELEASE_STRING: ${{ steps.versiongen.outputs.semver_release_string }}
+          IS_SNAPSHOT: ${{ steps.versiongen.outputs.semver_is_snapshot }}
+        run: |
+          if [[ "$IS_SNAPSHOT" == "true" ]] ; then
+            echo "PRESIDE_VERSION=${RELEASE_NUMBER}-snapshot" >> $GITHUB_ENV
+            echo "RELEASE_VERSION=${RELEASE_NUMBER}-snapshot" >> $GITHUB_ENV
+            echo "TAG=v${RELEASE_NUMBER}-snapshot" >> $GITHUB_ENV
+            echo "ZIP_FILE=preside-test-helpers-${RELEASE_NUMBER}-snapshot.zip" >> $GITHUB_ENV
+          else
+            echo "PRESIDE_VERSION=${RELEASE_NUMBER}" >> $GITHUB_ENV
+            echo "RELEASE_VERSION=${RELEASE_STRING}" >> $GITHUB_ENV
+            echo "TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+            echo "ZIP_FILE=preside-test-helpers-${RELEASE_STRING/+/-}.zip" >> $GITHUB_ENV
+          fi
+
+      # Publish exactly the package the self-tests ran against
+      - name: Download tested package
+        uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: dist/preside-test-helpers/
+
+      - name: Zip package
+        run: |
+          cd dist/preside-test-helpers
+          zip -rq ../../$ZIP_FILE *
+        shell: bash
+
+      # Snapshots are one rolling release per Preside version (10.32.0-snapshot), as in Preside itself
+      - name: Create release and upload asset
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_SNAPSHOT: ${{ steps.versiongen.outputs.semver_is_snapshot }}
+        run: |
+          prerelease=""
+          if [[ "$IS_SNAPSHOT" == "true" ]] ; then
+            prerelease="--prerelease"
+            gh release delete "$TAG" --cleanup-tag --yes || true
+          fi
+          gh release create "$TAG" "$ZIP_FILE" \
+            --target "${{ github.sha }}" \
+            --title "Release $RELEASE_VERSION" \
+            --notes "Built from Preside $PRESIDE_VERSION" \
+            $prerelease
+          echo "download_url=https://github.com/${{ github.repository }}/releases/download/${TAG}/${ZIP_FILE}" >> $GITHUB_OUTPUT
+
+      # The publish action substitutes $DOWNLOAD_URL into box.json itself
+      - name: Publish to forgebox
+        uses: pixl8/github-action-box-publish@v7
+        env:
+          BOXJSON_DIR: /dist/preside-test-helpers
+          DOWNLOAD_URL: ${{ steps.release.outputs.download_url }}
+        with:
+          forgebox_user: ${{ secrets.FORGEBOX_USER }}
+          forgebox_pass: ${{ secrets.FORGEBOX_PASS }}
+          ignore_timeouts: "true"

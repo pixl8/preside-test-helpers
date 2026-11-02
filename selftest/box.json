@@ -1,0 +1,15 @@
+{
+    "name":"preside-test-helpers-selftest",
+    "slug":"preside-test-helpers-selftest",
+    "version":"0.0.0",
+    "private":true,
+    "devDependencies":{
+        "preside-test-helpers":"folder:../dist/preside-test-helpers"
+    },
+    "installPaths":{
+        "preside-test-helpers":"preside-test-helpers/"
+    },
+    "testbox":{
+        "runner":"http://127.0.0.1:5941/runTests.cfm"
+    }
+}
